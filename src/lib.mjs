@@ -456,3 +456,27 @@ export function makeRedactor(values = []) {
     return out;
   };
 }
+
+// ---- CI of a PR --------------------------------------------------------------------------------
+
+const CI_OK = new Set(['success', 'skipped', 'neutral']);
+
+/**
+ * State of the GitHub Actions runs of one commit (REST `actions/runs?head_sha=`; fine-grained
+ * tokens cannot read check runs through GraphQL, which `gh pr checks` needs).
+ * Latest attempt per workflow counts. → { state: 'none'|'pending'|'failed'|'passed', failed: [names] }
+ */
+export function ciState(runs = []) {
+  const latest = new Map();
+  for (const r of runs) {
+    const key = r.workflow_id ?? r.name;
+    const prev = latest.get(key);
+    if (!prev || (r.run_attempt ?? 1) > (prev.run_attempt ?? 1) || ((r.run_attempt ?? 1) === (prev.run_attempt ?? 1) && Number(r.id) > Number(prev.id))) latest.set(key, r);
+  }
+  const all = [...latest.values()];
+  if (!all.length) return { state: 'none', failed: [] };
+  const failed = all.filter((r) => r.status === 'completed' && !CI_OK.has(r.conclusion)).map((r) => `${r.name} (${r.conclusion})`);
+  if (failed.length) return { state: 'failed', failed };
+  if (all.some((r) => r.status !== 'completed')) return { state: 'pending', failed: [] };
+  return { state: 'passed', failed: [] };
+}

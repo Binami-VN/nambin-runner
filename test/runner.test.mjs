@@ -400,3 +400,13 @@ echo done
     ops.server.close();
   }
 });
+
+test('ciState: latest attempt per workflow decides', async () => {
+  const { ciState } = await import('../src/lib.mjs');
+  assert.deepEqual(ciState([]), { state: 'none', failed: [] });
+  const run = (o) => ({ id: 1, name: 'CI', workflow_id: 1, run_attempt: 1, status: 'completed', conclusion: 'success', ...o });
+  assert.equal(ciState([run({}), run({ id: 2, workflow_id: 2, name: 'Lint', status: 'in_progress', conclusion: null })]).state, 'pending');
+  assert.deepEqual(ciState([run({}), run({ id: 2, workflow_id: 2, name: 'Lint', conclusion: 'failure' })]), { state: 'failed', failed: ['Lint (failure)'] });
+  assert.equal(ciState([run({ conclusion: 'failure' }), run({ id: 2, run_attempt: 2 })]).state, 'passed');
+  assert.equal(ciState([run({}), run({ id: 2, workflow_id: 2, conclusion: 'skipped' })]).state, 'passed');
+});

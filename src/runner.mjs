@@ -27,6 +27,7 @@ import {
   PM,
   SECRET_PATTERNS,
   branchName,
+  ciState,
   countSeverities,
   declaredPackages,
   forbiddenChanges,
@@ -890,14 +891,31 @@ async function handleTaskInner(cfg, api, task) {
  * check passes. The merge commit on the base branch is what starts the repo's own release/deploy.
  */
 async function mergeWhenGreen(p, branch, log) {
-  for (let attempt = 0; ; attempt++) {
-    // Checks show up a few seconds after the PR is opened or the branch is pushed.
-    await sleep(15_000);
-    log.add(`Chờ CI của PR ${branch} (${p.name})…`);
-    const res = await run('gh', ['pr', 'checks', branch, '--watch', '--interval', '20', '--fail-fast'], { cwd: p.path, timeoutMs: 40 * 60_000 });
-    if (res.code === 0) break;
-    if (/no checks reported/i.test(res.out) && attempt < 5) continue;
-    throw new Error(`CI của PR không qua, không merge:\n${tail(res.out, 1500)}`);
+  const sha = await git(p.path, ['rev-parse', `refs/heads/${branch}^{commit}`]);
+  log.add(`Chờ CI của PR ${branch} (${p.name}, ${sha.slice(0, 10)})…`);
+  const deadline = Date.now() + 40 * 60_000;
+  // Runs show up a few seconds after the PR is opened or the branch is pushed.
+  const noneUntil = Date.now() + 3 * 60_000;
+  let errors = 0;
+  for (;;) {
+    await sleep(20_000);
+    const res = await run('gh', ['api', `repos/{owner}/{repo}/actions/runs?head_sha=${sha}&per_page=100`, '--jq', '[.workflow_runs[] | {id, name, workflow_id, run_attempt, status, conclusion}]'], { cwd: p.path, timeoutMs: 60_000 });
+    if (res.code !== 0) {
+      if (++errors >= 5) throw new Error(`Không đọc được CI của PR (token cần quyền Actions: Read):\n${tail(res.out, 1000)}`);
+      continue;
+    }
+    errors = 0;
+    let runs;
+    try {
+      runs = JSON.parse(res.stdout || '[]');
+    } catch {
+      runs = [];
+    }
+    const ci = ciState(runs);
+    if (ci.state === 'passed') break;
+    if (ci.state === 'failed') throw new Error(`CI của PR không qua, không merge: ${ci.failed.join(', ')}`);
+    if (ci.state === 'none' && Date.now() > noneUntil) throw new Error('PR không có CI nào chạy (GitHub Actions), không merge');
+    if (Date.now() > deadline) throw new Error('CI của PR chạy quá 40 phút, không merge');
   }
   log.add(`✔ CI xanh, merge ${branch} vào ${p.baseBranch} (${p.name})`);
   const merged = await run('gh', ['pr', 'merge', branch, '--squash', '--delete-branch'], { cwd: p.path, timeoutMs: 120_000 });
