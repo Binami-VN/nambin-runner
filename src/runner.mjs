@@ -17,7 +17,7 @@
  *   --config <file>               default ./runner.config.json
  */
 import { execFile, spawn } from 'node:child_process';
-import { copyFileSync, existsSync, mkdirSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdirSync, rmSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -271,11 +271,11 @@ async function resolveBase(p, log) {
   return (await refExists(p.path, remoteRef)) ? remoteRef : p.baseBranch;
 }
 
-async function createWorktree(cfg, p, task, log, { branch = null, at = null, install = true } = {}) {
+async function createWorktree(cfg, p, task, log, { branch = null, at = null, install = true, dir: inDir = null } = {}) {
   const base = at ?? (await resolveBase(p, log));
   const baseSha = await git(p.path, ['rev-parse', `${base}^{commit}`]);
-  const dir = path.join(cfg.worktreeDir, `${task.site.slug}-${p.name}-${task.id}`);
-  mkdirSync(cfg.worktreeDir, { recursive: true });
+  const dir = inDir ?? path.join(cfg.worktreeDir, `${task.site.slug}-${p.name}-${task.id}`);
+  mkdirSync(path.dirname(dir), { recursive: true });
   if (existsSync(dir)) await run('git', ['worktree', 'remove', '--force', dir], { cwd: p.path });
   await run('git', ['worktree', 'prune'], { cwd: p.path });
   await git(p.path, branch ? ['worktree', 'add', '-B', branch, dir, baseSha] : ['worktree', 'add', '--detach', dir, baseSha]);
@@ -371,7 +371,7 @@ async function publishBranch(cfg, task, wt, log) {
 // cfg.engines is the order to try; when one fails (quota, rate limit, outage) the worktree is
 // reset and the next one gets the same task.
 
-async function withAgent(cfg, cwd, log, fn) {
+async function withAgent(cfg, cwd, log, fn, resetDirs = [cwd]) {
   const engines = cfg.engines;
   if (!engines.length) throw new Error('Chưa có agent sửa code: cần CURSOR_API_KEY, hoặc AGENT_LLM_BASE_URL + AGENT_LLM_MODEL (+ AGENT_LLM_API_KEY) trong .env của runner');
   for (let i = 0; ; i++) {
@@ -382,8 +382,10 @@ async function withAgent(cfg, cwd, log, fn) {
       if (err instanceof CancelledError || log.cancelled || i + 1 >= engines.length) throw err;
       log.add(`⚠️ Agent ${engine} lỗi (${head(String(err.message), 300)}), chuyển sang ${engines[i + 1]}`);
       // The next agent starts from the base commit, not from a half-done edit.
-      await run('git', ['reset', '--hard', '-q'], { cwd });
-      await run('git', ['clean', '-fdq'], { cwd });
+      for (const dir of resetDirs) {
+        await run('git', ['reset', '--hard', '-q'], { cwd: dir });
+        await run('git', ['clean', '-fdq'], { cwd: dir });
+      }
     }
   }
 }
@@ -642,10 +644,44 @@ function fixPrompt(task, p) {
   ].join('\n');
 }
 
+/** One task over several projects: the agent works in a folder with one worktree per project. */
+function multiFixPrompt(task, wts) {
+  const input = task.input ?? {};
+  const s = task.site ?? {};
+  const desc = (name) => (s.projects ?? []).find((p) => p.name === name)?.description;
+  const checks = (p) => p.checks.map((c) => `\`${c.cmd} ${c.args.join(' ')}\``).join(', ');
+  return [
+    `Site: ${s.name ?? s.slug} (${s.siteUrl ?? ''})${s.stack ? `, stack: ${s.stack}` : ''}.`,
+    s.brief ? `About the site: ${s.brief}` : '',
+    'This task may span several projects. The current folder holds one git worktree per project:',
+    ...wts.map((wt) => `- \`${wt.p.name}/\`${desc(wt.p.name) ? ` — ${desc(wt.p.name)}` : ''}${wt.p.checks.length ? ` (must pass, run inside \`${wt.p.name}/\`: ${checks(wt.p)})` : ''}`),
+    '',
+    `Task: ${task.title}`,
+    '',
+    String(input.prompt ?? ''),
+    input.files?.length ? `\nFiles to look at first: ${input.files.join(', ')}` : '',
+    input.reviewerNote ? `\nThe reviewer rejected a previous attempt with this note, address it: ${input.reviewerNote}` : '',
+    '',
+    'Change every project the task needs, and only those. Keep the contract between them consistent (routes, request/response fields, types).',
+    `The projects are merged and deployed one after another, in this order: ${wts.map((wt) => wt.p.name).join(' → ')}. For a few minutes the new version of one runs against the old version of the next: keep changes backward compatible (add fields or endpoints, do not rename or remove what the other project still uses).`,
+    'Run the checks of every project you changed before you finish.',
+    AGENT_RULES,
+    '',
+    'End with a short summary in Vietnamese (markdown): **Nguyên nhân**, **Thay đổi** (theo từng dự án), **Cách kiểm chứng**.',
+  ]
+    .filter((l) => l !== '')
+    .join('\n');
+}
+
 // ---- handlers --------------------------------------------------------------------------------
 
 async function handleCodeFix(cfg, task, log) {
-  const name = resolveProject(cfg.sites[task.site.slug], task.site, task.input);
+  const siteCfg = cfg.sites[task.site.slug];
+  if (task.input?.project === 'all') {
+    const names = projectsFor(siteCfg, task.input);
+    if (names.length > 1) return handleMultiFix(cfg, task, log, names);
+  }
+  const name = resolveProject(siteCfg, task.site, task.input);
   const p = projectCfg(cfg, task, name);
   const wt = await createWorktree(cfg, p, task, log, { branch: branchName(task) });
   try {
@@ -688,6 +724,83 @@ async function handleCodeFix(cfg, task, log) {
     };
   } finally {
     await removeWorktree(wt);
+  }
+}
+
+async function handleMultiFix(cfg, task, log, names) {
+  const root = path.join(cfg.worktreeDir, `${task.site.slug}-multi-${task.id}`);
+  const branch = branchName(task);
+  const wts = [];
+  mkdirSync(root, { recursive: true });
+  try {
+    if (sandbox.cfg?.acl) {
+      await new Promise((resolve) => execFile('setfacl', ['-m', `u:${sandbox.cfg.user}:x`, path.resolve(cfg.worktreeDir)], () => resolve()));
+      await shareDir(root, { recursive: false });
+    }
+    for (const name of names) wts.push(await createWorktree(cfg, projectCfg(cfg, task, name), task, log, { branch, dir: path.join(root, name) }));
+    const runAll = async () => {
+      const out = [];
+      for (const wt of wts) out.push(...(await runChecks(cfg, wt, log)));
+      return out;
+    };
+    let checks = [];
+    const agentSummary = await withAgent(
+      cfg,
+      root,
+      log,
+      async (send) => {
+        let summary = await send(multiFixPrompt(task, wts));
+        for (let attempt = 0; ; attempt++) {
+          log.throwIfCancelled();
+          checks = await runAll();
+          const failed = checks.filter((c) => !c.ok);
+          if (!failed.length || attempt >= cfg.fixAttempts) break;
+          log.add(`Kiểm tra thất bại (${failed.map((c) => c.name).join(', ')}), yêu cầu agent sửa tiếp…`);
+          summary = await send(
+            `These checks fail after your change (the name starts with the project folder):\n\n${failed.map((c) => `### ${c.name}\n\`\`\`\n${tail(c.output, 6000)}\n\`\`\``).join('\n\n')}\n\nFix them (if a failure is unrelated to your change and also fails on the base branch, say so instead). End with the same Vietnamese summary.`,
+          );
+        }
+        return summary;
+      },
+      wts.map((wt) => wt.dir),
+    );
+    const changes = [];
+    for (const wt of wts) {
+      const change = await commitChanges(wt, `fix(ops): ${head(task.title, 60)}\n\nNAMBIN Ops task ${task.id}`);
+      if (change) changes.push({ wt, ...change });
+    }
+    const changed = changes.map((c) => c.wt.p.name);
+    if (!changes.length) return { status: 'done', summary: `Agent không thay đổi code.\n\n${agentSummary}`, checks, data: { project: 'all', projects: [] } };
+    const diff = changes.map((c) => c.diff).join('');
+    if (diff.length > DIFF_MAX) throw new Error(`Diff quá lớn (${diff.length} ký tự)`);
+    for (const c of changes) await publishBranch(cfg, task, c.wt, log);
+    const failed = checks.filter((c) => !c.ok);
+    return {
+      status: 'needs_review',
+      summary: [
+        `Dự án thay đổi: **${changed.join(', ')}** (merge theo thứ tự này sau khi duyệt, chỉ khi CI của tất cả đều xanh).`,
+        failed.length ? `⚠️ Còn ${failed.length} bước kiểm tra lỗi: ${failed.map((c) => c.name).join(', ')}` : checks.length ? '✅ Các bước kiểm tra đều qua.' : '⚠️ Dự án chưa có bước kiểm tra tự động.',
+        '',
+        agentSummary,
+        '',
+        '```',
+        ...changes.map((c) => `${c.wt.p.name}:\n${c.stat}`),
+        '```',
+      ].join('\n'),
+      diff,
+      branch,
+      baseRef: changes.length === 1 ? changes[0].wt.baseSha : null,
+      checks,
+      data: { project: changed.join('+'), projects: changed, files: changes.flatMap((c) => c.files.map((f) => `${c.wt.p.name}/${f}`)), bases: Object.fromEntries(changes.map((c) => [c.wt.p.name, c.wt.baseSha])) },
+    };
+  } finally {
+    for (const wt of wts) {
+      await removeWorktree(wt);
+      // Unchanged projects keep no review branch (apply would open an empty PR from it).
+      const ahead = await run('git', ['rev-list', '--count', `${wt.baseSha}..refs/heads/${branch}`], { cwd: wt.p.path });
+      if (ahead.code === 0 && ahead.stdout.trim() === '0') await run('git', ['branch', '-D', branch], { cwd: wt.p.path });
+    }
+    rmSync(root, { recursive: true, force: true });
   }
 }
 
@@ -890,7 +1003,7 @@ async function handleTaskInner(cfg, api, task) {
  * `merge` (after an admin approved the diff): wait for the PR's CI, squash-merge only if every
  * check passes. The merge commit on the base branch is what starts the repo's own release/deploy.
  */
-async function mergeWhenGreen(p, branch, log) {
+async function waitForCi(p, branch, log) {
   const sha = await git(p.path, ['rev-parse', `refs/heads/${branch}^{commit}`]);
   log.add(`Chờ CI của PR ${branch} (${p.name}, ${sha.slice(0, 10)})…`);
   const deadline = Date.now() + 40 * 60_000;
@@ -917,7 +1030,11 @@ async function mergeWhenGreen(p, branch, log) {
     if (ci.state === 'none' && Date.now() > noneUntil) throw new Error('PR không có CI nào chạy (GitHub Actions), không merge');
     if (Date.now() > deadline) throw new Error('CI của PR chạy quá 40 phút, không merge');
   }
-  log.add(`✔ CI xanh, merge ${branch} vào ${p.baseBranch} (${p.name})`);
+  log.add(`✔ CI xanh: ${branch} (${p.name})`);
+}
+
+async function mergePr(p, branch, log) {
+  log.add(`Merge ${branch} vào ${p.baseBranch} (${p.name})`);
   const merged = await run('gh', ['pr', 'merge', branch, '--squash', '--delete-branch'], { cwd: p.path, timeoutMs: 120_000 });
   if (merged.code !== 0) throw new Error(`Merge thất bại: ${tail(merged.out, 1000)}`);
 }
@@ -930,6 +1047,7 @@ async function applyTask(cfg, api, task) {
     const site = cfg.sites[task.site?.slug];
     if (!site) throw new Error(`Máy runner không cấu hình site ${task.site?.slug}`);
     const notes = [];
+    const toMerge = [];
     for (const p of Object.values(site.projects)) {
       if (!existsSync(path.join(p.path, '.git'))) continue;
       if (!(await refExists(p.path, `refs/heads/${task.branch}`))) {
@@ -951,14 +1069,23 @@ async function applyTask(cfg, api, task) {
           else note += ` (không tạo được PR: ${tail(pr.out, 300)})`;
         }
         if (url) note += `, PR: ${url}`;
-        if (url && site.merge) {
-          await mergeWhenGreen(p, task.branch, log);
-          note += `, CI xanh → đã merge vào ${p.baseBranch} (deploy chạy tự động)`;
-        }
+        if (url && site.merge) toMerge.push({ p, i: notes.length });
       }
       notes.push(note);
     }
     if (!notes.length) throw new Error(`Không tìm thấy nhánh ${task.branch} ở repo nào của site ${site.slug} trên máy này`);
+    // Several projects: merge none until the CI of every PR is green, then in config order.
+    for (const { p } of toMerge) {
+      try {
+        await waitForCi(p, task.branch, log);
+      } catch (err) {
+        throw new Error(`${err.message}${toMerge.length > 1 ? `\n(${p.name}; chưa merge dự án nào)` : ''}\n${notes.join('\n')}`);
+      }
+    }
+    for (const { p, i } of toMerge) {
+      await mergePr(p, task.branch, log);
+      notes[i] += `, CI xanh → đã merge vào ${p.baseBranch} (deploy chạy tự động)`;
+    }
     await log.close();
     await api.applied(task.id, true, notes.join('\n'));
     stats.applied += 1;

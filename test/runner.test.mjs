@@ -410,3 +410,73 @@ test('ciState: latest attempt per workflow decides', async () => {
   assert.equal(ciState([run({ conclusion: 'failure' }), run({ id: 2, run_attempt: 2 })]).state, 'passed');
   assert.equal(ciState([run({}), run({ id: 2, workflow_id: 2, conclusion: 'skipped' })]).state, 'passed');
 });
+
+test('code_fix over several projects: one folder per project, combined diff, branch only where changed', async () => {
+  const mk = (files) => {
+    const repo = gitRepo(files);
+    const remote = tmp();
+    sh(remote, 'init', '-q', '--bare', '-b', 'main');
+    sh(repo, 'remote', 'add', 'origin', remote);
+    sh(repo, 'push', '-q', 'origin', 'main');
+    return { repo, remote };
+  };
+  const api = mk({ 'route.txt': 'old\n', 'check.sh': 'grep -q new route.txt\n' });
+  const web = mk({ 'page.txt': 'old\n', 'check.sh': 'test -f page.txt\n' });
+  const other = mk({ 'x.txt': 'x\n' });
+  const dir = tmp();
+  const bin = path.join(dir, 'opencode');
+  const seen = path.join(dir, 'seen.txt');
+  // Edits api/ and web/ from the parent folder; never touches other/.
+  writeFileSync(
+    bin,
+    `#!/bin/sh
+{ echo "pwd:$(pwd)"; ls; echo "prompt:$*"; } >> "${seen}"
+echo new > api/route.txt
+echo new > web/page.txt
+echo "**Thay đổi** api + web"
+`,
+  );
+  chmodSync(bin, 0o755);
+  const check = [{ name: 'check', cmd: 'sh', args: ['check.sh'] }];
+  const config = path.join(dir, 'runner.config.json');
+  writeFileSync(
+    config,
+    JSON.stringify({
+      worktreeDir: path.join(dir, 'wt'),
+      fixAttempts: 0,
+      sites: {
+        demo: {
+          publishBranch: true,
+          projects: {
+            api: { path: api.repo, install: false, checks: check },
+            web: { path: web.repo, install: false, checks: check },
+            other: { path: other.repo, install: false },
+          },
+        },
+      },
+    }),
+  );
+  const multiSite = { ...site, projects: [{ name: 'api', description: 'Backend', pathPrefixes: [] }, { name: 'web', pathPrefixes: [] }] };
+  const ops = await fakeOps([{ id: 'task00000000000000000010', kind: 'code_fix', title: 'Thêm trường', input: { prompt: 'add a field end to end', project: 'all' }, site: multiSite }]);
+  try {
+    await runRunner(config, { NAMBIN_OPS_URL: ops.url, NAMBIN_OPS_RUNNER_TOKEN: 'tok', AGENT_LLM_BASE_URL: 'https://llm.example.com/v1', AGENT_LLM_MODEL: 'm', OPENCODE_BIN: bin, GIT_PUSH_TOKEN: '' });
+    const r = ops.seen.results[0];
+    assert.equal(r.status, 'needs_review', JSON.stringify(r));
+    assert.match(r.diff, /a\/api\/route\.txt/);
+    assert.match(r.diff, /a\/web\/page\.txt/);
+    assert.deepEqual(r.data.projects, ['api', 'web']);
+    assert.deepEqual(r.checks.map((c) => `${c.name}:${c.ok}`), ['api check:true', 'web check:true']);
+    assert.match(r.summary, /api, web/);
+    const log = readFileSync(seen, 'utf8');
+    assert.match(log, /pwd:\S*demo-multi-task00000000000000000010/);
+    assert.match(log, /api\nother\nweb|api\nweb/);
+    assert.match(log, /`api\/` — Backend/);
+    assert.match(log, /api → web → other/);
+    for (const x of [api, web]) assert.ok(sh(x.remote, 'branch', '--list', r.branch), 'review branch published');
+    assert.equal(sh(other.remote, 'branch', '--list', r.branch), '');
+    assert.equal(sh(other.repo, 'branch', '--list', r.branch), '', 'no empty branch left in the unchanged repo');
+    assert.ok(!existsSync(path.join(dir, 'wt', 'demo-multi-task00000000000000000010')));
+  } finally {
+    ops.server.close();
+  }
+});
