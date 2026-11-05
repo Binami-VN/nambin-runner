@@ -44,6 +44,13 @@ setup() {
   command -v setfacl >/dev/null || sudo apt-get install -y -qq acl
   id agent >/dev/null 2>&1 || sudo useradd --create-home --home-dir "$OPS/agent-home" --shell /bin/bash agent
   sudo chmod 700 "$OPS/agent-home"
+  # The hosted image's sudoers ignores `sudo -E`; the agent needs its (scrubbed) environment:
+  # LLM config, PATH. Only for running as `agent`, nothing else changes.
+  printf '%s ALL=(agent) NOPASSWD:SETENV: ALL\n' "$(id -un)" | sudo tee /etc/sudoers.d/zz-ops-agent >/dev/null
+  sudo chmod 440 /etc/sudoers.d/zz-ops-agent
+  sudo visudo -cq -f /etc/sudoers.d/zz-ops-agent
+  # Last rule wins (zz- sorts after the image's own file). Check the environment really passes.
+  [ "$(X_OPS_PROBE=1 sudo -n -E -u agent -- /usr/bin/env 2>&1 | grep -c '^X_OPS_PROBE=1$')" = 1 ] || { echo "sudo -E không giữ được biến môi trường"; return 1; }
   sudo chmod 700 "$HOME"
   # Tools the agent needs, outside the closed home.
   sudo install -m 755 "$(command -v bun)" /usr/local/bin/bun

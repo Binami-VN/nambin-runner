@@ -104,8 +104,13 @@ export function setSandbox(cfg) {
 function untrusted(cmd, args, env) {
   const sb = sandbox.cfg;
   if (!sb) return [cmd, args, env];
-  // sudo replaces PATH (secure_path): pass PATH and HOME on the env command line, they are not secret.
-  return [sb.sudo, ['-n', '-E', '-u', sb.user, '--', '/usr/bin/env', `PATH=${env.PATH ?? process.env.PATH ?? ''}`, `HOME=${sb.home}`, cmd, ...args], { ...env, HOME: sb.home }];
+  // sudo replaces PATH (secure_path): pass PATH, HOME and the XDG dirs on the env command line, they
+  // are not secret. CI images point XDG_* into the runner's (closed) home; the agent gets its own.
+  const dirs = { HOME: sb.home, XDG_CONFIG_HOME: `${sb.home}/.config`, XDG_DATA_HOME: `${sb.home}/.local/share`, XDG_CACHE_HOME: `${sb.home}/.cache`, XDG_STATE_HOME: `${sb.home}/.local/state` };
+  const fixed = [`PATH=${env.PATH ?? process.env.PATH ?? ''}`, ...Object.entries(dirs).map(([k, v]) => `${k}=${v}`)];
+  const rest = { ...env, ...dirs };
+  delete rest.XDG_RUNTIME_DIR;
+  return [sb.sudo, ['-n', '-E', '-u', sb.user, '--', '/usr/bin/env', ...fixed, cmd, ...args], rest];
 }
 
 function gitEnv(cwd) {

@@ -386,8 +386,8 @@ echo done
     assert.ok(sh(remote, 'branch', '--list', r.branch), 'review branch published');
     assert.ok(!existsSync(path.join(dir, 'pwned')), "the agent's hook never ran");
     const calls = readFileSync(sudoLog, 'utf8');
-    assert.match(calls, /-u agent -- \/usr\/bin\/env PATH=\S* HOME=\S*agent-home \S*opencode run/);
-    assert.match(calls, /-u agent -- \/usr\/bin\/env PATH=\S* HOME=\S*agent-home sh check\.sh/);
+    assert.match(calls, /-u agent -- \/usr\/bin\/env PATH=\S* HOME=\S*agent-home XDG_CONFIG_HOME=\S*agent-home\/\.config (XDG_\S+ )+\S*opencode run/);
+    assert.match(calls, /-u agent -- \/usr\/bin\/env PATH=\S* HOME=\S*agent-home (XDG_\S+ )+sh check\.sh/);
     assert.match(calls, /\/bin\/kill -KILL -1/);
     assert.ok(!/HOME=\S+ git /.test(calls), 'git runs as the runner, not through sudo');
     const log = readFileSync(seen, 'utf8');
