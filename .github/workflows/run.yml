@@ -37,15 +37,65 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+      # Asks Ops first: an idle run (most scheduled ones) ends here, in seconds.
+      - name: Check
+        id: check
+        env:
+          RUNNER_ENV: ${{ secrets.RUNNER_ENV }}
+        run: bash ci/check.sh
+      - if: steps.check.outputs.work == 'true'
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 22
-      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+      - if: steps.check.outputs.work == 'true'
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
           bun-version: 1.4.2
+      - name: Prepare
+        if: steps.check.outputs.work == 'true'
+        run: sudo mkdir -p /srv/ops/cache && sudo chown -R "$(id -un):" /srv/ops && chmod 711 /srv/ops
+      # Caches (readable by anyone who can run a workflow here, so: public npm packages and the
+      # runner's own tools only, never code of the projects or build output).
+      #   tools: runner dependencies + OpenCode, installed by the runner user, never writable by the agent
+      #   deps:  bun / npm download caches the sandboxed installs fill
+      - name: Restore tools
+        id: tools
+        if: steps.check.outputs.work == 'true'
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            /srv/ops/runner/node_modules
+            /srv/ops/tools
+          key: tools-v1-${{ runner.os }}-${{ hashFiles('package.json', 'ci/run.sh') }}
+      - name: Restore deps
+        id: deps
+        if: steps.check.outputs.work == 'true'
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: /srv/ops/cache
+          key: deps-v1-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: deps-v1-${{ runner.os }}-
       - name: Run
+        id: run
+        if: steps.check.outputs.work == 'true'
         env:
           RUNNER_ENV: ${{ secrets.RUNNER_ENV }}
           RUNNER_CONFIG: ${{ secrets.RUNNER_CONFIG }}
           REASON: ${{ inputs.reason || github.event_name }}
+          TOOLS_CACHED: ${{ steps.tools.outputs.cache-hit }}
         run: bash ci/run.sh
+      - name: Save tools
+        if: always() && steps.run.outputs.tools_ok == 'true' && steps.tools.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            /srv/ops/runner/node_modules
+            /srv/ops/tools
+          key: ${{ steps.tools.outputs.cache-primary-key }}
+      # Only when the download cache changed (a new key per content), not on every run.
+      - name: Save deps
+        if: always() && steps.run.outputs.deps_key != '' && !startsWith(steps.deps.outputs.cache-matched-key, steps.run.outputs.deps_key)
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: /srv/ops/cache
+          key: ${{ steps.run.outputs.deps_key }}

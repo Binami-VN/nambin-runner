@@ -699,6 +699,16 @@ async function handleCodeReview(cfg, task, log) {
   await run('git', ['fetch', '--quiet', p.remote], { cwd: p.path, timeoutMs: 120_000 });
   const headRef = range.includes('..') ? range.split(/\.{2,3}/)[1] || 'HEAD' : range;
   const diffArgs = range.includes('..') ? [range] : [`${range}~1`, range];
+  // CI clones are shallow: fetch the whole history when the range reaches past it.
+  const ends = range.includes('..') ? range.split(/\.{2,3}/).filter(Boolean) : [`${range}~1`];
+  if (existsSync(path.join(p.path, '.git', 'shallow'))) {
+    let missing = false;
+    for (const ref of ends) if (!(await refExists(p.path, ref))) missing = true;
+    if (missing) {
+      log.add('Lấy thêm lịch sử git (clone nông)…');
+      await run('git', ['fetch', '--quiet', '--unshallow', p.remote], { cwd: p.path, timeoutMs: 300_000 });
+    }
+  }
   const diff = await git(p.path, ['diff', ...diffArgs]);
   if (!diff.trim()) return { status: 'done', summary: `Không có thay đổi trong \`${range}\`.`, data: { project: name, ref: range } };
   const stat = await git(p.path, ['diff', '--stat', ...diffArgs]);

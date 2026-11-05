@@ -8,6 +8,7 @@
 set -uo pipefail
 umask 077
 OPS=/srv/ops
+OPENCODE_VERSION=1.19.5
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ME="$(id -un)"
 
@@ -52,11 +53,22 @@ setup() {
   sudo ln -sf /usr/local/bin/bun /usr/local/bin/bunx
 
   # Runner code where the agent can read it (the Cursor worker runs as agent); no secrets in it.
-  mkdir -p "$OPS/runner"
+  # node_modules and OpenCode may come from the Actions cache (key: package.json + this file).
+  mkdir -p "$OPS/runner" "$OPS/tools"
+  rm -rf "$OPS/runner/src"
   cp -R "$HERE/src" "$HERE/package.json" "$OPS/runner/"
-  (cd "$OPS/runner" && npm install --no-audit --no-fund --omit=dev)
-  [ -n "${OPENCODE_BIN:-}" ] || npm install -g --no-audit --no-fund opencode-ai@1.19.5
-  chmod -R go+rX "$OPS/runner"
+  if [ "${TOOLS_CACHED:-}" != true ] || [ ! -d "$OPS/runner/node_modules/@cursor/sdk" ]; then
+    (cd "$OPS/runner" && npm install --no-audit --no-fund --omit=dev)
+  fi
+  if [ -z "${OPENCODE_BIN:-}" ] && { [ "${TOOLS_CACHED:-}" != true ] || [ ! -x "$OPS/tools/node_modules/.bin/opencode" ]; }; then
+    npm install --prefix "$OPS/tools" --no-audit --no-fund "opencode-ai@$OPENCODE_VERSION"
+  fi
+  chmod -R go+rX,go-w "$OPS/runner" "$OPS/tools"
+  echo "tools_ok=true" >>"${GITHUB_OUTPUT:-/dev/null}"
+
+  # Download caches of the sandboxed installs (bun, npm): the agent writes them.
+  mkdir -p "$OPS/cache/bun" "$OPS/cache/npm"
+  setfacl -R -m "u:agent:rwX,d:u:agent:rwX,d:u:$ME:rwX" "$OPS/cache"
 
   # Repos: OPS_REPOS="api=Owner/repo web=Owner/repo"; token only in git's environment.
   local basic
@@ -66,8 +78,9 @@ setup() {
     echo "repo ${pair%%=*}"
     name="${pair%%=*}"; repo="${pair#*=}"
     [[ "$name" =~ ^[A-Za-z0-9._-]+$ && "$repo" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ ]] || { echo "OPS_REPOS sai: $pair"; return 1; }
+      # Recent history only (reviews of older commits deepen it on demand); file contents on use.
     GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=http.https://github.com/.extraheader GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $basic" \
-      git clone -q --filter=blob:none "${OPS_GIT_BASE:-https://github.com}/$repo.git" "$OPS/repos/$name"
+      git clone -q --depth 50 --no-single-branch --filter=blob:none "${OPS_GIT_BASE:-https://github.com}/$repo.git" "$OPS/repos/$name"
     git -C "$OPS/repos/$name" config user.name "NAMBIN Ops Agent"
     git -C "$OPS/repos/$name" config user.email "ops-agent@nambin.com"
   done
@@ -83,13 +96,23 @@ if ! (setup) >>"$LOG" 2>&1; then
   code=2
 else
   # The runner reads $OPS/.env itself (next to its config).
-  (cd "$OPS/runner" && RUNNER_SANDBOX_USER=agent RUNNER_SANDBOX_HOME="$OPS/agent-home" node src/runner.mjs --once --config "$OPS/runner.config.json") >>"$LOG" 2>&1 || code=$?
+  opencode="$(envval OPENCODE_BIN)"
+  [ -n "$opencode" ] || opencode="$OPS/tools/node_modules/.bin/opencode"
+  (cd "$OPS/runner" && OPENCODE_BIN="$opencode" BUN_INSTALL_CACHE_DIR="$OPS/cache/bun" npm_config_cache="$OPS/cache/npm" \
+    RUNNER_SANDBOX_USER=agent RUNNER_SANDBOX_HOME="$OPS/agent-home" node src/runner.mjs --once --config "$OPS/runner.config.json") >>"$LOG" 2>&1 || code=$?
 fi
 
 # Report to Ops (redacts every value of .env first). Nothing of it reaches this page.
 (cd "$HERE" && node src/report.mjs "$LOG" "$code" "$OPS/.env") >/dev/null 2>&1 || echo "⚠️ Không gửi được báo cáo về Ops"
 sudo -n -u agent -- /bin/kill -KILL -1 >/dev/null 2>&1 || true
 rm -f "$OPS/.env" "$OPS/runner.config.json" "$LOG"
+
+# Download cache: hand it back to this user for the save step; new key only when it changed.
+if [ "$code" != 2 ] && [ -d "$OPS/cache" ]; then
+  sudo chown -R "$ME:" "$OPS/cache" 2>/dev/null || true
+  sum="$(cd "$OPS/cache" && find . -type f -printf '%P %s\n' 2>/dev/null | LC_ALL=C sort | sha256sum | cut -c1-16)"
+  [ "$(find "$OPS/cache" -type f | head -1)" ] && echo "deps_key=deps-v1-${RUNNER_OS:-Linux}-$sum" >>"${GITHUB_OUTPUT:-/dev/null}"
+fi
 
 if [ "$code" = 0 ]; then echo "✅ Thành công"; else echo "❌ Thất bại — chi tiết trên Ops (Quản trị → Runner)"; fi
 exit "$code"
