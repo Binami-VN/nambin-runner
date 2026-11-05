@@ -336,8 +336,8 @@ test('sandbox: agent and checks run as the sandbox user, git ignores a rewritten
     `#!/bin/sh
 echo "$*" >> "${sudoLog}"
 case "$*" in *"/bin/kill"*) exit 0 ;; esac
-[ "$1" = -n ] && [ "$2" = -E ] && [ "$3" = -u ] && [ "$4" = agent ] && [ "$5" = -- ] || exit 97
-shift 5
+[ "$1" = -n ] && [ "$2" = -u ] && [ "$3" = agent ] && [ "$4" = -- ] || exit 97
+shift 4
 exec "$@"
 `,
   );
@@ -386,8 +386,8 @@ echo done
     assert.ok(sh(remote, 'branch', '--list', r.branch), 'review branch published');
     assert.ok(!existsSync(path.join(dir, 'pwned')), "the agent's hook never ran");
     const calls = readFileSync(sudoLog, 'utf8');
-    assert.match(calls, /-u agent -- \/usr\/bin\/env PATH=\S* HOME=\S*agent-home XDG_CONFIG_HOME=\S*agent-home\/\.config (XDG_\S+ )+\S*opencode run/);
-    assert.match(calls, /-u agent -- \/usr\/bin\/env PATH=\S* HOME=\S*agent-home (XDG_\S+ )+sh check\.sh/);
+    assert.match(calls, /-u agent -- \/usr\/bin\/env -i PATH=\S* HOME=\S*agent-home XDG_CONFIG_HOME=\S*agent-home\/\.config .*\S*opencode run/);
+    assert.match(calls, /-u agent -- \/usr\/bin\/env -i PATH=\S* HOME=\S*agent-home .*sh check\.sh/);
     assert.match(calls, /\/bin\/kill -KILL -1/);
     assert.ok(!/HOME=\S+ git /.test(calls), 'git runs as the runner, not through sudo');
     const log = readFileSync(seen, 'utf8');
