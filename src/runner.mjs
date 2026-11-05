@@ -271,16 +271,44 @@ async function resolveBase(p, log) {
   return (await refExists(p.path, remoteRef)) ? remoteRef : p.baseBranch;
 }
 
-async function createWorktree(cfg, p, task, log, { branch = null, at = null, install = true, dir: inDir = null } = {}) {
+/**
+ * Tip of an earlier review branch ("sửa tiếp"), fetched from the remote when this machine does not
+ * have it. null when this repo has no such branch.
+ */
+async function continueTip(p, from) {
+  if (!from || !isAgentBranch(from)) return null;
+  await run('git', ['fetch', '--quiet', p.remote, `+refs/heads/${from}:refs/remotes/${p.remote}/${from}`], { cwd: p.path, timeoutMs: 120_000 });
+  for (const ref of [`refs/remotes/${p.remote}/${from}`, `refs/heads/${from}`]) if (await refExists(p.path, ref)) return git(p.path, ['rev-parse', `${ref}^{commit}`]);
+  return null;
+}
+
+/** Where the continued branch left the base branch (deepens a shallow clone when needed). */
+async function forkPoint(p, base, tip) {
+  for (let i = 0; i < 2; i++) {
+    const res = await run('git', ['merge-base', base, tip], { cwd: p.path });
+    if (res.code === 0 && res.stdout.trim()) return res.stdout.trim();
+    await run('git', ['fetch', '--quiet', '--unshallow', p.remote], { cwd: p.path, timeoutMs: 300_000 });
+  }
+  throw new Error(`Không tìm được điểm rẽ nhánh giữa ${base} và nhánh cũ`);
+}
+
+async function createWorktree(cfg, p, task, log, { branch = null, at = null, install = true, dir: inDir = null, from = null } = {}) {
   const base = at ?? (await resolveBase(p, log));
-  const baseSha = await git(p.path, ['rev-parse', `${base}^{commit}`]);
+  const fromSha = from ? await continueTip(p, from) : null;
+  // Continuing: the new branch starts at the old one; diffs stay against where it left main.
+  const baseSha = fromSha ? await forkPoint(p, base, fromSha) : await git(p.path, ['rev-parse', `${base}^{commit}`]);
+  const startSha = fromSha ?? baseSha;
   const dir = inDir ?? path.join(cfg.worktreeDir, `${task.site.slug}-${p.name}-${task.id}`);
   mkdirSync(path.dirname(dir), { recursive: true });
   if (existsSync(dir)) await run('git', ['worktree', 'remove', '--force', dir], { cwd: p.path });
   await run('git', ['worktree', 'prune'], { cwd: p.path });
-  await git(p.path, branch ? ['worktree', 'add', '-B', branch, dir, baseSha] : ['worktree', 'add', '--detach', dir, baseSha]);
+  await git(p.path, branch ? ['worktree', 'add', '-B', branch, dir, startSha] : ['worktree', 'add', '--detach', dir, startSha]);
   await shareWorktree(cfg, dir);
-  log.add(`Worktree ${p.name} tại ${base} (${baseSha.slice(0, 10)})${branch ? ` → nhánh ${branch}` : ''}`);
+  log.add(
+    fromSha
+      ? `Worktree ${p.name} làm tiếp nhánh ${from} (${fromSha.slice(0, 10)}, rẽ từ ${base} tại ${baseSha.slice(0, 10)})${branch ? ` → nhánh ${branch}` : ''}`
+      : `Worktree ${p.name} tại ${base} (${baseSha.slice(0, 10)})${branch ? ` → nhánh ${branch}` : ''}`,
+  );
   for (const file of p.copyFiles) {
     const from = path.join(p.path, file);
     if (existsSync(from)) copyFileSync(from, path.join(dir, file));
@@ -290,7 +318,7 @@ async function createWorktree(cfg, p, task, log, { branch = null, at = null, ins
     const res = await run(p.install[0], p.install.slice(1), { cwd: dir, timeoutMs: 10 * 60_000 });
     if (res.code !== 0) throw new Error(`Cài thư viện thất bại:\n${tail(res.out, 2000)}`);
   }
-  return { p, dir, branch, base, baseSha };
+  return { p, dir, branch, base, baseSha, fromSha };
 }
 
 async function removeWorktree(wt) {
@@ -338,6 +366,10 @@ async function runChecks(cfg, wt, log) {
   return checks;
 }
 
+/**
+ * Commits what the agent changed in this round. diff/stat/files: everything since the base
+ * (with "sửa tiếp", earlier rounds included: that is what gets merged). round: this round only.
+ */
 async function commitChanges(wt, message) {
   await git(wt.dir, ['add', '-A']);
   const names = (await git(wt.dir, ['diff', '--cached', '--name-only', wt.baseSha])).split('\n').filter(Boolean);
@@ -347,9 +379,21 @@ async function commitChanges(wt, message) {
   const prefix = [`--src-prefix=a/${wt.p.name}/`, `--dst-prefix=b/${wt.p.name}/`];
   const diff = await git(wt.dir, ['diff', '--cached', ...prefix, wt.baseSha]);
   const stat = await git(wt.dir, ['diff', '--cached', '--stat', wt.baseSha]);
-  const identity = (await run('git', ['config', 'user.email'], { cwd: wt.dir })).stdout.trim() ? [] : ['-c', 'user.name=NAMBIN Ops Agent', '-c', 'user.email=ops-agent@nambin.local'];
-  await git(wt.dir, [...identity, 'commit', '--no-verify', '-q', '-m', message]);
-  return { diff: `${diff}\n`, stat, files: names };
+  const round = (await git(wt.dir, ['diff', '--cached', '--stat', 'HEAD'])).trim();
+  if (round) {
+    const identity = (await run('git', ['config', 'user.email'], { cwd: wt.dir })).stdout.trim() ? [] : ['-c', 'user.name=NAMBIN Ops Agent', '-c', 'user.email=ops-agent@nambin.local'];
+    await git(wt.dir, [...identity, 'commit', '--no-verify', '-q', '-m', message]);
+  }
+  return { diff: `${diff}\n`, stat, files: names, round };
+}
+
+/** Summary lines about the revision round ("sửa tiếp"), empty for a first attempt. */
+function roundNote(task, changes) {
+  const n = task.input?.round;
+  if (!task.input?.continueBranch || !n) return [];
+  const delta = changes.filter((c) => c.round);
+  if (!delta.length) return [`⚠️ Vòng ${n}: agent không thay đổi thêm so với vòng trước. Diff dưới đây là toàn bộ thay đổi các vòng.`];
+  return [`🔁 Vòng ${n} (làm tiếp nhánh ${task.input.continueBranch}). Diff dưới đây là toàn bộ thay đổi so với ${changes[0].wt.p.baseBranch}; riêng vòng này:`, '```', ...delta.map((c) => (changes.length > 1 ? `${c.wt.p.name}:\n${c.round}` : c.round)), '```'];
 }
 
 /**
@@ -623,6 +667,22 @@ function siteIntro(task, name) {
   ].filter(Boolean);
 }
 
+/** Earlier rounds of a "sửa tiếp" chain: what the agent said and what the reviewer asked. */
+function historyPrompt(task) {
+  const input = task.input ?? {};
+  const history = Array.isArray(input.history) ? input.history : [];
+  if (!input.continueBranch || !history.length) return [];
+  return [
+    '',
+    `This is revision round ${input.round ?? history.length + 1} of this task. The working tree already contains (committed) everything from the earlier rounds: continue from it, do NOT start over or revert it unless the reviewer asks.`,
+    'Earlier rounds, oldest first:',
+    ...history.map((h) => `\n### Round ${h.round}\nYour summary then:\n${head(String(h.summary ?? ''), 1500)}\nReviewer's request after it:\n${String(h.note ?? '')}`),
+    '',
+    `Now do what the reviewer asked in the LAST note: ${String(history[history.length - 1].note ?? '')}`,
+    'Use `git diff HEAD~1` / `git log` to see what is already done.',
+  ];
+}
+
 function fixPrompt(task, p) {
   const input = task.input ?? {};
   const declared = (task.site?.projects ?? []).find((x) => x.name === p.name);
@@ -635,6 +695,7 @@ function fixPrompt(task, p) {
     String(input.prompt ?? ''),
     files.length ? `\nFiles to look at first (repo-relative): ${files.join(', ')}` : '',
     input.reviewerNote ? `\nThe reviewer rejected a previous attempt with this note, address it: ${input.reviewerNote}` : '',
+    ...historyPrompt(task),
     '',
     'Find the root cause in the source code and fix it.',
     checks ? `The change must pass ${checks}; run them before you finish.` : 'There are no automated checks configured; verify your change carefully.',
@@ -661,6 +722,7 @@ function multiFixPrompt(task, wts) {
     String(input.prompt ?? ''),
     input.files?.length ? `\nFiles to look at first: ${input.files.join(', ')}` : '',
     input.reviewerNote ? `\nThe reviewer rejected a previous attempt with this note, address it: ${input.reviewerNote}` : '',
+    ...historyPrompt(task),
     '',
     'Change every project the task needs, and only those. Keep the contract between them consistent (routes, request/response fields, types).',
     `The projects are merged and deployed one after another, in this order: ${wts.map((wt) => wt.p.name).join(' → ')}. For a few minutes the new version of one runs against the old version of the next: keep changes backward compatible (add fields or endpoints, do not rename or remove what the other project still uses).`,
@@ -683,7 +745,12 @@ async function handleCodeFix(cfg, task, log) {
   }
   const name = resolveProject(siteCfg, task.site, task.input);
   const p = projectCfg(cfg, task, name);
-  const wt = await createWorktree(cfg, p, task, log, { branch: branchName(task) });
+  const from = task.input?.continueBranch ?? null;
+  const wt = await createWorktree(cfg, p, task, log, { branch: branchName(task), from });
+  if (from && !wt.fromSha) {
+    await removeWorktree(wt);
+    throw new Error(`Không tìm thấy nhánh cũ ${from} ở dự án ${name} (đã merge hoặc bị xoá?). Dùng Chạy lại để làm từ đầu.`);
+  }
   try {
     let checks = [];
     const agentSummary = await withAgent(cfg, wt.dir, log, async (send) => {
@@ -708,6 +775,7 @@ async function handleCodeFix(cfg, task, log) {
     return {
       status: 'needs_review',
       summary: [
+        ...roundNote(task, [{ wt, ...change }]),
         failed.length ? `⚠️ Còn ${failed.length} bước kiểm tra lỗi: ${failed.map((c) => c.name).join(', ')}` : checks.length ? '✅ Các bước kiểm tra đều qua.' : '⚠️ Dự án chưa có bước kiểm tra tự động.',
         '',
         agentSummary,
@@ -737,7 +805,9 @@ async function handleMultiFix(cfg, task, log, names) {
       await new Promise((resolve) => execFile('setfacl', ['-m', `u:${sandbox.cfg.user}:x`, path.resolve(cfg.worktreeDir)], () => resolve()));
       await shareDir(root, { recursive: false });
     }
-    for (const name of names) wts.push(await createWorktree(cfg, projectCfg(cfg, task, name), task, log, { branch, dir: path.join(root, name) }));
+    const from = task.input?.continueBranch ?? null;
+    for (const name of names) wts.push(await createWorktree(cfg, projectCfg(cfg, task, name), task, log, { branch, dir: path.join(root, name), from }));
+    if (from && !wts.some((wt) => wt.fromSha)) throw new Error(`Không tìm thấy nhánh cũ ${from} ở dự án nào (đã merge hoặc bị xoá?). Dùng Chạy lại để làm từ đầu.`);
     const runAll = async () => {
       const out = [];
       for (const wt of wts) out.push(...(await runChecks(cfg, wt, log)));
@@ -778,6 +848,7 @@ async function handleMultiFix(cfg, task, log, names) {
     return {
       status: 'needs_review',
       summary: [
+        ...roundNote(task, changes),
         `Dự án thay đổi: **${changed.join(', ')}** (merge theo thứ tự này sau khi duyệt, chỉ khi CI của tất cả đều xanh).`,
         failed.length ? `⚠️ Còn ${failed.length} bước kiểm tra lỗi: ${failed.map((c) => c.name).join(', ')}` : checks.length ? '✅ Các bước kiểm tra đều qua.' : '⚠️ Dự án chưa có bước kiểm tra tự động.',
         '',
@@ -1085,6 +1156,11 @@ async function applyTask(cfg, api, task) {
     for (const { p, i } of toMerge) {
       await mergePr(p, task.branch, log);
       notes[i] += `, CI xanh → đã merge vào ${p.baseBranch} (deploy chạy tự động)`;
+      // Branches of the earlier rounds ("sửa tiếp") are part of what was just merged.
+      const old = new Set([task.input?.continueBranch, ...(Array.isArray(task.input?.history) ? task.input.history.map((h) => h?.branch) : [])]);
+      for (const b of old) {
+        if (b && b !== task.branch && isAgentBranch(b)) await run('git', ['push', '--quiet', p.remote, '--delete', b], { cwd: p.path, timeoutMs: 60_000 });
+      }
     }
     await log.close();
     await api.applied(task.id, true, notes.join('\n'));

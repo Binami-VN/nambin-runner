@@ -480,3 +480,78 @@ echo "**Thay đổi** api + web"
     ops.server.close();
   }
 });
+
+test('sửa tiếp: round 2 starts from the round-1 branch, sees the history, reviews the whole change', async () => {
+  const repo = gitRepo({ 'a.txt': 'base\n', 'b.txt': 'base\n' });
+  const remote = tmp();
+  sh(remote, 'init', '-q', '--bare', '-b', 'main');
+  sh(repo, 'remote', 'add', 'origin', remote);
+  sh(repo, 'push', '-q', 'origin', 'main');
+  // Round 1 (another run) left this branch on the remote.
+  const maker = tmp();
+  execFileSync('git', ['clone', '-q', remote, maker]);
+  sh(maker, 'checkout', '-q', '-b', 'ops/demo/code-fix-11111111');
+  writeFileSync(path.join(maker, 'a.txt'), 'round1\n');
+  sh(maker, '-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-qam', 'round 1');
+  sh(maker, 'push', '-q', 'origin', 'ops/demo/code-fix-11111111');
+  // main moved on meanwhile: the review diff must not show that as a change.
+  writeFileSync(path.join(repo, 'c.txt'), 'later\n');
+  sh(repo, 'add', 'c.txt');
+  sh(repo, 'commit', '-qm', 'main moves');
+  sh(repo, 'push', '-q', 'origin', 'main');
+
+  const dir = tmp();
+  const bin = path.join(dir, 'opencode');
+  const seen = path.join(dir, 'seen.txt');
+  writeFileSync(bin, `#!/bin/sh\n{ echo "a:$(cat a.txt)"; echo "prompt:$*"; } >> "${seen}"\necho round2 > b.txt\necho "**Thay đổi** b"\n`);
+  chmodSync(bin, 0o755);
+  const config = path.join(dir, 'runner.config.json');
+  writeFileSync(config, JSON.stringify({ worktreeDir: path.join(dir, 'wt'), fixAttempts: 0, sites: { demo: { publishBranch: true, projects: { app: { path: repo, install: false } } } } }));
+  const input = {
+    prompt: 'change a and b',
+    project: 'app',
+    continueBranch: 'ops/demo/code-fix-11111111',
+    round: 2,
+    history: [{ round: 1, branch: 'ops/demo/code-fix-11111111', summary: 'Đã sửa a.txt', note: 'sửa thêm b.txt' }],
+  };
+  const ops = await fakeOps([{ id: 'task00000000000000000022', kind: 'code_fix', title: '(vòng 2) Sửa', input, site }]);
+  try {
+    await runRunner(config, { NAMBIN_OPS_URL: ops.url, NAMBIN_OPS_RUNNER_TOKEN: 'tok', AGENT_LLM_BASE_URL: 'https://llm.example.com/v1', AGENT_LLM_MODEL: 'm', OPENCODE_BIN: bin, GIT_PUSH_TOKEN: '' });
+    const r = ops.seen.results[0];
+    assert.equal(r.status, 'needs_review', JSON.stringify(r));
+    const log = readFileSync(seen, 'utf8');
+    assert.match(log, /a:round1/, 'worktree starts with round 1');
+    assert.match(log, /revision round 2/);
+    assert.match(log, /Đã sửa a\.txt/);
+    assert.match(log, /LAST note: sửa thêm b\.txt/);
+    assert.match(r.diff, /\+round1/, 'whole change under review');
+    assert.match(r.diff, /\+round2/);
+    assert.ok(!r.diff.includes('c.txt'), 'main moving on is not part of the change');
+    assert.match(r.summary, /Vòng 2/);
+    assert.match(r.summary, /b\.txt/);
+    assert.equal(r.branch, 'ops/demo/code-fix-00000022');
+    const tip = sh(remote, 'rev-parse', r.branch);
+    assert.equal(sh(remote, 'rev-parse', `${tip}~1`), sh(remote, 'rev-parse', 'ops/demo/code-fix-11111111'), 'round 2 commits on top of round 1');
+  } finally {
+    ops.server.close();
+  }
+});
+
+test('sửa tiếp: missing old branch is a clear error', async () => {
+  const repo = gitRepo({ 'a.txt': 'base\n' });
+  const remote = tmp();
+  sh(remote, 'init', '-q', '--bare', '-b', 'main');
+  sh(repo, 'remote', 'add', 'origin', remote);
+  sh(repo, 'push', '-q', 'origin', 'main');
+  const dir = tmp();
+  const config = path.join(dir, 'runner.config.json');
+  writeFileSync(config, JSON.stringify({ worktreeDir: path.join(dir, 'wt'), sites: { demo: { publishBranch: true, projects: { app: { path: repo, install: false } } } } }));
+  const ops = await fakeOps([{ id: 'task00000000000000000023', kind: 'code_fix', title: 'x', input: { prompt: 'x', project: 'app', continueBranch: 'ops/demo/code-fix-99999999', round: 2, history: [] }, site }]);
+  try {
+    await runRunner(config, { NAMBIN_OPS_URL: ops.url, NAMBIN_OPS_RUNNER_TOKEN: 'tok', AGENT_LLM_BASE_URL: 'https://llm.example.com/v1', AGENT_LLM_MODEL: 'm', OPENCODE_BIN: '/bin/true', GIT_PUSH_TOKEN: '' }, 1);
+    assert.equal(ops.seen.results[0].status, 'failed');
+    assert.match(ops.seen.results[0].error, /Không tìm thấy nhánh cũ/);
+  } finally {
+    ops.server.close();
+  }
+});
