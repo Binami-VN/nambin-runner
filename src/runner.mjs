@@ -100,6 +100,10 @@ export function setSandbox(cfg) {
   sandbox.worktrees.clear();
 }
 
+/** Process-state variables of the runner: the sandboxed command gets its own (PWD would make
+ *  tools like OpenCode work in the runner's directory instead of the worktree). */
+const DROP_FOR_SANDBOX = new Set(['PWD', 'OLDPWD', 'SHLVL', '_', 'XDG_RUNTIME_DIR', 'USER', 'LOGNAME', 'MAIL', 'SUDO_USER', 'SUDO_UID', 'SUDO_GID', 'SUDO_COMMAND']);
+
 /** [cmd, args, env] to start an untrusted command (agent, check, install). */
 function untrusted(cmd, args, env) {
   const sb = sandbox.cfg;
@@ -110,8 +114,11 @@ function untrusted(cmd, args, env) {
   // runner's closed home; the agent gets its own dirs.
   const dirs = { HOME: sb.home, XDG_CONFIG_HOME: `${sb.home}/.config`, XDG_DATA_HOME: `${sb.home}/.local/share`, XDG_CACHE_HOME: `${sb.home}/.cache`, XDG_STATE_HOME: `${sb.home}/.local/state` };
   const vars = { PATH: env.PATH ?? process.env.PATH ?? '', ...dirs };
+  const ownHome = process.env.HOME || '/nonexistent';
   for (const [k, v] of Object.entries(env)) {
-    if (k in vars || k === 'XDG_RUNTIME_DIR' || v == null || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(k)) continue;
+    if (v == null || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(k) || DROP_FOR_SANDBOX.has(k) || k === 'PATH' || k === 'HOME') continue;
+    // Keep XDG dirs a caller chose (OpenCode's own), never ones inside the runner's home.
+    if (k in dirs && (String(v) === ownHome || String(v).startsWith(ownHome + '/'))) continue;
     vars[k] = String(v);
   }
   const assign = Object.entries(vars).map(([k, v]) => `${k}=${v}`);
