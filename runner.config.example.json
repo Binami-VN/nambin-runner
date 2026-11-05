@@ -1,0 +1,35 @@
+{
+  "opsUrl": "https://ops.example.com",
+  "name": "build-mac",
+  "model": "composer-2.5",
+  "fixAttempts": 1,
+  "defaults": { "baseBranch": "main", "remote": "origin", "createPr": false },
+  "sites": {
+    "my-site": {
+      "createPr": true,
+      "projects": {
+        "api": {
+          "path": "~/code/my-api",
+          "copyFiles": [".env.test"],
+          "checks": [
+            { "name": "typecheck", "cmd": "bun", "args": ["run", "typecheck"] },
+            { "name": "test", "cmd": "bun", "args": ["test"] }
+          ]
+        },
+        "web": {
+          "path": "~/code/my-web",
+          "checks": [{ "name": "typecheck", "cmd": "npx", "args": ["tsc", "--noEmit"] }]
+        }
+      }
+    },
+    "shop-wp": {
+      "projects": {
+        "theme": {
+          "path": "~/sources/shop/wp-content/themes/shop",
+          "packageManager": "composer",
+          "checks": [{ "name": "phpcs", "cmd": "vendor/bin/phpcs", "args": ["--standard=WordPress", "."] }]
+        }
+      }
+    }
+  }
+}

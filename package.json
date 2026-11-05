@@ -1,0 +1,27 @@
+{
+  "name": "@nambin/ops-runner",
+  "version": "0.1.0",
+  "description": "NAMBIN Ops runner: fixes, reviews, updates and scans the source code of your sites, pushes only after approval",
+  "type": "module",
+  "license": "MIT",
+  "bin": {
+    "nambin-runner": "src/runner.mjs"
+  },
+  "files": [
+    "src",
+    "runner.config.example.json",
+    ".env.example"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node src/runner.mjs",
+    "once": "node src/runner.mjs --once",
+    "ping": "node src/runner.mjs ping",
+    "test": "node --test test/*.test.mjs"
+  },
+  "dependencies": {
+    "@cursor/sdk": "1.3.1"
+  }
+}

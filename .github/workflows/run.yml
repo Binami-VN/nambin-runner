@@ -1,0 +1,51 @@
+name: Runner
+# Constant title: nothing about the task shows on the public run list.
+run-name: Runner
+
+# The run page shows only "succeeded" or "failed". Everything else (config, repos, agent output,
+# check results) goes to a log file on the machine, then to Ops (Quản trị → Runner) and Telegram.
+#
+# Secrets (only workflows of this repository's default branch can read them; forks get none):
+#   RUNNER_ENV     dotenv: NAMBIN_OPS_URL, NAMBIN_OPS_RUNNER_TOKEN, GIT_PUSH_TOKEN, OPS_REPOS,
+#                  CURSOR_API_KEY and/or AGENT_LLM_BASE_URL + AGENT_LLM_MODEL + AGENT_LLM_API_KEY…
+#   RUNNER_CONFIG  runner.config.json (sites, projects, checks)
+# Nothing is read from repository variables: their values would be printed in the step header.
+on:
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: Why
+        required: false
+        default: manual
+  schedule:
+    - cron: '17 */6 * * *'
+
+# The job needs no GitHub API access through GITHUB_TOKEN.
+permissions: {}
+
+concurrency:
+  group: runner
+  cancel-in-progress: false
+
+jobs:
+  run:
+    # Never in forks (they have no secrets, but no point burning their minutes either).
+    if: github.repository_owner == 'Binami-VN'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.4.2
+      - name: Run
+        env:
+          RUNNER_ENV: ${{ secrets.RUNNER_ENV }}
+          RUNNER_CONFIG: ${{ secrets.RUNNER_CONFIG }}
+          REASON: ${{ inputs.reason || github.event_name }}
+        run: bash ci/run.sh
