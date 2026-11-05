@@ -22,10 +22,23 @@ chmod 600 "$OPS/.env" "$OPS/runner.config.json"
 missing=$([ -n "${RUNNER_ENV:-}" ] && [ -n "${RUNNER_CONFIG:-}" ] || echo 1)
 unset RUNNER_ENV RUNNER_CONFIG
 
+# One value of the .env file, without running it through the shell (values may contain spaces).
+envval() {
+  local v
+  v="$(grep -m1 "^$1=" "$OPS/.env" | cut -d= -f2-)" || true
+  v="${v%\"}"; v="${v#\"}"; v="${v%\'}"; v="${v#\'}"
+  printf '%s' "$v"
+}
+
 setup() {
   set -e
   [ -z "$missing" ] || { echo "Thiếu secret RUNNER_ENV / RUNNER_CONFIG"; return 1; }
-  set -a; . "$OPS/.env"; set +a
+  local GIT_PUSH_TOKEN OPS_REPOS OPENCODE_BIN OPS_GIT_BASE
+  GIT_PUSH_TOKEN="$(envval GIT_PUSH_TOKEN)"
+  OPS_REPOS="$(envval OPS_REPOS | tr ',' ' ')"
+  OPENCODE_BIN="$(envval OPENCODE_BIN)"
+  OPS_GIT_BASE="$(envval OPS_GIT_BASE)"
+  [ -n "$OPS_REPOS" ] || { echo "Thiếu OPS_REPOS"; return 1; }
 
   # Sandbox user. Home of the CI user (checkout, _temp files, runner diag logs) closed to others.
   command -v setfacl >/dev/null || sudo apt-get install -y -qq acl
@@ -48,6 +61,7 @@ setup() {
   basic="$(printf 'x-access-token:%s' "$GIT_PUSH_TOKEN" | base64 -w0)"
   mkdir -p "$OPS/repos"
   for pair in $OPS_REPOS; do
+    echo "repo ${pair%%=*}"
     name="${pair%%=*}"; repo="${pair#*=}"
     [[ "$name" =~ ^[A-Za-z0-9._-]+$ && "$repo" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ ]] || { echo "OPS_REPOS sai: $pair"; return 1; }
     GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=http.https://github.com/.extraheader GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $basic" \
@@ -66,8 +80,8 @@ code=0
 if ! (setup) >>"$LOG" 2>&1; then
   code=2
 else
-  (cd "$OPS/runner" && set -a && . "$OPS/.env" && set +a && \
-    RUNNER_SANDBOX_USER=agent RUNNER_SANDBOX_HOME="$OPS/agent-home" node src/runner.mjs --once --config "$OPS/runner.config.json") >>"$LOG" 2>&1 || code=$?
+  # The runner reads $OPS/.env itself (next to its config).
+  (cd "$OPS/runner" && RUNNER_SANDBOX_USER=agent RUNNER_SANDBOX_HOME="$OPS/agent-home" node src/runner.mjs --once --config "$OPS/runner.config.json") >>"$LOG" 2>&1 || code=$?
 fi
 
 # Report to Ops (redacts every value of .env first). Nothing of it reaches this page.
